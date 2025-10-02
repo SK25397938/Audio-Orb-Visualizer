@@ -1,4 +1,4 @@
-![Demo](assets/visualizer_demo.gif)
+![Demo](visualizer_demo.gif)
 
 This project is a Circular Audio Spectrum Visualizer built in Python using matplotlib and sounddevice.
 
