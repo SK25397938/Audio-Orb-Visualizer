@@ -1,4 +1,4 @@
-https://github.com/SK25397938/Audio-Orb-Visualizer/blob/main/Visualizer.mp4
+![Visualizer Preview](https://github.com/SK25397938/Audio-Orb-Visualizer/blob/main/Visualizer.png)
 
 # Circular Audio Spectrum Visualizer (Pygame + Sounddevice)
 
