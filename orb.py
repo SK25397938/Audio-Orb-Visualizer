@@ -1,32 +1,94 @@
-# orb_ncs_glow_clean.py — Circular audio spectrum visualizer (with 3D Depth Illusion + Gradient Shadows)
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import pygame
 import sounddevice as sd
-import queue, sys
-from matplotlib.colors import hsv_to_rgb
+import queue
+import threading
+import time
+from collections import deque
 
 # ---------- Configuration ----------
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 2048
-DEVICE_INDEX = 16  # Change this to your loopback device index
-NUM_BARS = 120
-ALPHA = 0.1
+DEVICE_INDEX = 16  
+NUM_BARS = 180
+ALPHA = 0.15
 MOTION_BLUR = True
-BLUR_FRAMES = 5
-NUM_SHADOW_RINGS = 8  # how many gradient shadow rings inside orb
-# -----------------------------------
+BLUR_FRAMES = 6
+MAX_QUEUE_SIZE = 5
+FPS = 144
+PEAK_COMPRESSION = 0.7
+MIN_RADIUS_FACTOR = 0.8
+MAX_RADIUS_FACTOR = 2.5
+RADIUS_SMOOTHING = 0.75 
+BAR_SMOOTHING = 0.25
+# Inner rings
+NUM_INNER_RINGS = 8
+INNER_REACTION_STRENGTH = 0.18  
+INNER_DECAY = 0.12               
 
-q = queue.Queue()
-smoothed_fft = np.zeros(NUM_BARS)
-smoothed_bass = 0.0
-circle_history = []
-audio_buffer = []
+
+# Shared audio data
+audio_data = {
+    'smoothed_fft': np.zeros(NUM_BARS),
+    'smoothed_bass': 0.0,
+    'last_update': 0.0,
+    'lock': threading.Lock()
+}
+q = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 
 def audio_callback(indata, frames, time, status):
     if status:
-        print(status, file=sys.stderr)
-    q.put(indata.copy())
+        print(status)
+    try:
+        q.put_nowait(indata.copy())
+    except queue.Full:
+        pass
+
+def audio_processing_thread():
+    """Processes live audio in a separate thread."""
+    while True:
+        try:
+            block = q.get(timeout=0.1)
+            if block.ndim > 1:
+                block = block.mean(axis=1)
+            block = block - np.mean(block)
+            windowed = block * np.hanning(len(block))
+            fft = np.abs(np.fft.rfft(windowed))
+            fft = fft / np.max(fft + 1e-6)
+
+            freqs = np.fft.rfftfreq(len(block), d=1.0/SAMPLE_RATE)
+            bands = np.interp(np.linspace(0, len(fft)-1, NUM_BARS),
+                              np.arange(len(fft)), fft)
+
+            if np.max(bands) > 0.1:
+                avg = np.mean(bands)
+                peak_threshold = avg + (np.max(bands) - avg) * 0.7
+                mask = bands > peak_threshold
+                if np.any(mask):
+                    compression_factor = 1.0 - PEAK_COMPRESSION * (bands[mask] - peak_threshold) / (np.max(bands) - peak_threshold + 1e-6)
+                    bands[mask] = peak_threshold + (bands[mask] - peak_threshold) * compression_factor
+
+            bands = np.clip(bands, 0, 1)
+
+            with audio_data['lock']:
+                audio_data['smoothed_fft'][:] = (
+                    ALPHA * bands + (1 - ALPHA) * audio_data['smoothed_fft']
+                )
+                bass_energy = np.mean(fft[freqs <= 60]) if np.any(freqs <= 60) else 0.0
+                audio_data['smoothed_bass'] = (
+                    ALPHA * bass_energy + (1 - ALPHA) * audio_data['smoothed_bass']
+                )
+                audio_data['last_update'] = time.time()
+
+        except queue.Empty:
+            with audio_data['lock']:
+                now = time.time()
+                if now - audio_data['last_update'] > 0.1:
+                    audio_data['smoothed_fft'] *= 0.95
+                    audio_data['smoothed_bass'] *= 0.95
+                    audio_data['last_update'] = now
+
+threading.Thread(target=audio_processing_thread, daemon=True).start()
 
 try:
     stream = sd.InputStream(device=DEVICE_INDEX, channels=2, samplerate=SAMPLE_RATE,
@@ -34,185 +96,186 @@ try:
     stream.start()
 except Exception as e:
     print("Couldn't start audio stream:", e)
-    sys.exit(1)
+    exit(1)
 
-# --- Setup figure ---
-plt.rcParams["toolbar"] = "none"
-theta_circle = np.linspace(0, 2*np.pi, 500)
+pygame.init()
+info = pygame.display.Info()
+WINDOW_WIDTH, WINDOW_HEIGHT = info.current_w, info.current_h
+screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.NOFRAME | pygame.SCALED)
+pygame.display.set_caption("Circular Spectrum Visualizer")
+clock = pygame.time.Clock()
 
-fig, ax = plt.subplots(figsize=(12, 12))
-fig.patch.set_facecolor("black")
-ax.set_facecolor("black")
-ax.axis("off")
-ax.set_aspect("equal")
+center_x = WINDOW_WIDTH // 2
+center_y = WINDOW_HEIGHT // 2
+scale_factor = min(WINDOW_WIDTH, WINDOW_HEIGHT) / 10
 
-# expanded limits
-ax.set_xlim(-5, 5)
-ax.set_ylim(-5, 5)
-
-# fullscreen
-figManager = plt.get_current_fig_manager()
-try: figManager.full_screen_toggle()
-except: pass
-
-# --- Glowing Circle ---
-circle_lines = [ax.plot([], [], lw=6 - g,
-                        color=(0.2,1.0,1.0,0.12*(g+1)))[0] for g in range(5)]
-
-# --- Motion Blur Circles ---
-blur_circles = []
-if MOTION_BLUR:
-    for i in range(BLUR_FRAMES):
-        alpha = 0.05 * (1 - i/BLUR_FRAMES)
-        blur = ax.plot([], [], lw=5, color=(0.2,1.0,1.0,alpha))[0]
-        blur_circles.append(blur)
-
-# --- Spectrum Bars ---
 angles = np.linspace(0, 2*np.pi, NUM_BARS, endpoint=False)
-bars = [ax.plot([], [], lw=2, color="cyan")[0] for _ in range(NUM_BARS)]
+circle_history = deque(maxlen=BLUR_FRAMES)
+alpha_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+reflection_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
 
-# --- Reflection Bars ---
-reflection_bars = [ax.plot([], [], lw=2, color="cyan", alpha=0.3)[0] for _ in range(NUM_BARS)]
+# Neon color gradient (bar colors)
+def neon_color(val):
+    val = np.clip(val, 0.0, 1.0)
+    r = int(120 + 135 * val)
+    g = int(100 + 155 * (1 - val))
+    b = int(255 * val)
+    return (r, g, b)
 
-# --- Reflection Circle ---
-reflection_circle = ax.plot([], [], lw=2, color=(0.2, 1.0, 1.0, 0.25))[0]
+display_radius = 0
+display_fft = np.zeros(NUM_BARS)
 
-# --- Depth Layers ---
-depth_layers = []
-NUM_DEPTH = 4
-for i in range(NUM_DEPTH):
-    alpha = 0.15 * (1 - i/NUM_DEPTH)
-    depth = ax.plot([], [], lw=2, color=(0.1, 0.7, 1.0, alpha))[0]
-    depth_layers.append(depth)
+# --- Inner ring state (persistent) ---
+inner_ring_offsets = [0.0 for _ in range(NUM_INNER_RINGS)]
+# per-ring smoothing rates slightly varied for staggered motion
+inner_ring_smooth = [INNER_DECAY + 0.02 * i for i in range(NUM_INNER_RINGS)]
 
-# --- Gradient Shadows (rings inside orb) ---
-shadow_rings = []
-for i in range(NUM_SHADOW_RINGS):
-    alpha = 0.25 * (1 - i/NUM_SHADOW_RINGS)  # fading effect
-    ring = ax.plot([], [], lw=1.5, color=(0, 0, 0, alpha))[0]
-    shadow_rings.append(ring)
+running = True
+frame_count = 0
 
-def process_block(block):
-    global smoothed_fft, smoothed_bass
-    if block.ndim > 1:
-        block = block.mean(axis=1)
-    block = block - np.mean(block)
-    windowed = block * np.hanning(len(block))
-    fft = np.abs(np.fft.rfft(windowed))
-    fft = fft / np.max(fft + 1e-6)
-    freqs = np.fft.rfftfreq(len(block), d=1.0/SAMPLE_RATE)
-    bands = np.interp(np.linspace(0, len(fft)-1, NUM_BARS), np.arange(len(fft)), fft)
-    smoothed_fft[:] = ALPHA * bands + (1 - ALPHA) * smoothed_fft
-    bass_energy = np.mean(fft[freqs <= 50]) if np.any(freqs <= 50) else 0.0
-    smoothed_bass = ALPHA * bass_energy + (1 - ALPHA) * smoothed_bass
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
 
-def init():
-    for c in circle_lines: c.set_data([], [])
-    for blur in blur_circles: blur.set_data([], [])
-    for bar in bars: bar.set_data([], [])
-    for rbar in reflection_bars: rbar.set_data([], [])
-    reflection_circle.set_data([], [])
-    for depth in depth_layers: depth.set_data([], [])
-    for ring in shadow_rings: ring.set_data([], [])
-    return circle_lines + blur_circles + bars + reflection_bars + [reflection_circle] + depth_layers + shadow_rings
+    screen.fill((0, 0, 0))
+    alpha_surface.fill((0, 0, 0, 0))
+    reflection_surface.fill((0, 0, 0, 0))
 
-def animate(frame):
-    global smoothed_fft, smoothed_bass, circle_history, audio_buffer
+    with audio_data['lock']:
+        smoothed_fft = audio_data['smoothed_fft'].copy()
+        smoothed_bass = audio_data['smoothed_bass']
 
-    while not q.empty():
-        block = q.get_nowait()
-        audio_buffer.append(block)
-    if audio_buffer:
-        process_block(audio_buffer[-1])
-        if len(audio_buffer) > 5: audio_buffer = audio_buffer[-5:]
-    else:
-        smoothed_fft *= 0.95
-        smoothed_bass *= 0.95
+    target_radius = (2.0 + smoothed_bass * 2.5) * scale_factor
+    display_radius += (target_radius - display_radius) * RADIUS_SMOOTHING
+    base_r = display_radius
+    display_fft += (smoothed_fft - display_fft) * BAR_SMOOTHING
 
-    base_r = 1.5 + smoothed_bass * 3.0
-    x_circ = base_r * np.cos(theta_circle)
-    y_circ = base_r * np.sin(theta_circle)
+    min_radius = base_r * MIN_RADIUS_FACTOR
+    max_radius = base_r * MAX_RADIUS_FACTOR
 
-    # history for blur
-    if MOTION_BLUR:
-        circle_history.append((x_circ.copy(), y_circ.copy(), base_r))
-        if len(circle_history) > BLUR_FRAMES:
-            circle_history.pop(0)
+    rotation = frame_count * 0.01
+    rotated_angles = angles + rotation
+    cos_vals = np.cos(rotated_angles)
+    sin_vals = np.sin(rotated_angles)
 
-    # glowing circle with dynamic pulse
-    for g, c in enumerate(circle_lines):
-        dynamic_alpha = 0.12 * (g+1) + smoothed_bass * 0.25
-        dynamic_alpha = min(dynamic_alpha, 1.0)  # clamp so it doesn't blow out
-        c.set_data(x_circ, y_circ)
-        c.set_linewidth(6 - g + smoothed_bass*3)  # stronger thickness on bass
-        c.set_color((0.2, 1.0, 1.0, dynamic_alpha))
+    reflection_angles = -rotated_angles
+    reflection_cos_vals = np.cos(reflection_angles)
+    reflection_sin_vals = np.sin(reflection_angles)
 
-    # reflection circle with dynamic pulse
-    dynamic_reflection_alpha = 0.25 + smoothed_bass * 0.3
-    dynamic_reflection_alpha = min(dynamic_reflection_alpha, 0.8)  # keep subtle
-    reflection_circle.set_data(x_circ, -y_circ)
-    reflection_circle.set_linewidth(2.5 + smoothed_bass*2)
-    reflection_circle.set_color((0.2, 1.0, 1.0, dynamic_reflection_alpha))
+    # --- Draw glowing bars ---
+    for i in range(NUM_BARS):
+        length = display_fft[i] * 2.2 * scale_factor
+        outer_r = min(base_r + length, max_radius)
+        constrained_base_r = max(min_radius, min(max_radius, base_r))
+        x_base = center_x + constrained_base_r * cos_vals[i]
+        y_base = center_y + constrained_base_r * sin_vals[i]
+        x_out = center_x + outer_r * cos_vals[i]
+        y_out = center_y + outer_r * sin_vals[i]
+        color = neon_color(display_fft[i])
+        width = max(2, int((2.0 + display_fft[i]*2) * scale_factor / 50))
 
+        # Glow layers
+        for g in range(3):
+            glow_alpha = 90 - g*25
+            pygame.draw.line(alpha_surface, (*color, glow_alpha),
+                             (x_base, y_base), (x_out, y_out), width + g*2)
 
-    # motion blur
-    if MOTION_BLUR and len(circle_history) > 1:
-        for i, blur in enumerate(blur_circles):
-            if i < len(circle_history) - 2:
-                hist_x, hist_y, hist_r = circle_history[-(i+2)]
-                scale = 1 - 0.04 * (i+1)
-                blur_x = hist_r * scale * np.cos(theta_circle)
-                blur_y = hist_r * scale * np.sin(theta_circle)
-                blur.set_data(blur_x, blur_y)
-                blur.set_linewidth(5 - i)
-            else:
-                blur.set_data([], [])
+        pygame.draw.line(screen, color, (x_base, y_base), (x_out, y_out), width)
 
-    # rotation + wave
-    rotation = frame * 0.02
-    wave = 0.15 * np.sin(angles * 3 + frame * 0.1)
-    rotated_angles = angles + rotation + wave
+        # Reflection
+        reflection_outer_r = min(base_r + length, max_radius)
+        reflection_x_base = center_x + constrained_base_r * reflection_cos_vals[i]
+        reflection_y_base = center_y + constrained_base_r * reflection_sin_vals[i]
+        reflection_x_out = center_x + reflection_outer_r * reflection_cos_vals[i]
+        reflection_y_out = center_y + reflection_outer_r * reflection_sin_vals[i]
+        reflection_alpha = 120
+        for blur in range(3):
+            blur_alpha = reflection_alpha - blur * 30
+            blur_width = max(1, width - blur)
+            pygame.draw.line(reflection_surface, (*color, blur_alpha),
+                             (reflection_x_base, reflection_y_base),
+                             (reflection_x_out, reflection_y_out), blur_width)
 
-    # bars + reflection
-    for i, bar in enumerate(bars):
-        length = smoothed_fft[i] * 2.0
-        x = [base_r * np.cos(rotated_angles[i]),
-             (base_r + length) * np.cos(rotated_angles[i])]
-        y = [base_r * np.sin(rotated_angles[i]),
-             (base_r + length) * np.sin(rotated_angles[i])]
+    # --- Dynamic luminous baseline ring (matches bar color) ---
+    constrained_ring_r = min(max_radius, base_r)
+    circle_points = [
+        (center_x + constrained_ring_r * np.cos(a),
+         center_y + constrained_ring_r * np.sin(a))
+        for a in np.linspace(0, 2*np.pi, 400)
+    ]
 
-        hue = 0.5 + 0.3 * smoothed_fft[i]
-        color = hsv_to_rgb([hue % 1.0, 1, 1])
+    # Dynamic color based on FFT intensity
+    energy_level = np.mean(display_fft)
+    ring_color = neon_color(energy_level)
 
-        bar.set_data(x, y)
-        bar.set_linewidth(3.0 + smoothed_fft[i]*2)
-        bar.set_color((*color, 0.9))
+    # Core bright ring
+    pygame.draw.lines(alpha_surface, (*ring_color, 220), True, circle_points, 3)
 
-        reflection_bars[i].set_data(x, [-yy for yy in y])
-        reflection_bars[i].set_linewidth(2.0 + smoothed_fft[i])
-        reflection_bars[i].set_color((*color, 0.25))
+    # Outer glow layers
+    for g in range(1, 8):
+        glow_alpha = max(0, 180 - g * 25)
+        fade_factor = 1.0 - g * 0.1
+        glow_color = (int(ring_color[0] * fade_factor),
+                      int(ring_color[1] * fade_factor),
+                      int(ring_color[2] * fade_factor),
+                      glow_alpha)
+        pygame.draw.lines(alpha_surface, glow_color, True, [
+            (center_x + (constrained_ring_r + g * 2) * np.cos(a),
+             center_y + (constrained_ring_r + g * 2) * np.sin(a))
+            for a in np.linspace(0, 2*np.pi, 400)
+        ], 3 + g)
 
-    reflection_circle.set_data(x_circ, -y_circ)
+    # === Inner holographic rings (inward-reacting) ===
+    inner_rotation = frame_count * 0.008  # slow rotation
+    # compute a bass-driven target offset for each ring (larger i -> slightly larger reaction)
+    for i in range(NUM_INNER_RINGS):
+        # target offset scales with bass and ring index — drives inward motion
+        target = smoothed_bass * scale_factor * (INNER_REACTION_STRENGTH + 0.02 * i)
+        # smooth toward target (decay/back to zero when bass drops)
+        smooth = inner_ring_smooth[i]
+        inner_ring_offsets[i] += (target - inner_ring_offsets[i]) * smooth
 
-    # depth illusion layers
-    for i, depth in enumerate(depth_layers):
-        offset = 0.05 * (i+1)
-        scale = 1.0 + 0.03 * i
-        x_depth = (base_r + offset) * np.cos(theta_circle + i*0.1)
-        y_depth = (base_r + offset) * np.sin(theta_circle + i*0.1)
-        depth.set_data(x_depth * scale, y_depth * scale)
+        # ring scale relative to the main ring (smaller for deeper rings)
+        scale = 1.0 - 0.08 * (i / max(1, NUM_INNER_RINGS))
+        # radius with inward offset applied (subtract offset to move inward on bass)
+        inner_r = max(8.0, constrained_ring_r * scale - inner_ring_offsets[i])
 
-    # gradient shadow rings
-    shadow_angle = frame * 0.015
-    for i, ring in enumerate(shadow_rings):
-        scale = 1 - 0.1 * (i / NUM_SHADOW_RINGS)  # shrink inner rings
-        ring_x = base_r * scale * np.cos(theta_circle + shadow_angle*(i+1))
-        ring_y = base_r * scale * np.sin(theta_circle + shadow_angle*(i+1))
-        ring.set_data(ring_x, ring_y)
-        ring.set_linewidth(1.5 + smoothed_bass*1.5)
+        # alpha fade for depth (inner rings dimmer)
+        alpha_level = int(120 * (1 - i / NUM_INNER_RINGS))  # up to ~120 alpha
+        # fade factor so more inner rings are subtler
+        fade_factor = 1.0 - (i / NUM_INNER_RINGS) * 0.6
 
-    return circle_lines + blur_circles + bars + reflection_bars + [reflection_circle] + depth_layers + shadow_rings
+        # choose a glow color derived from ring_color but dimmer for inner rings
+        glow_color = (
+            int(ring_color[0] * fade_factor),
+            int(ring_color[1] * fade_factor),
+            int(ring_color[2] * fade_factor),
+            alpha_level
+        )
 
-ani = animation.FuncAnimation(fig, animate, init_func=init, interval=1,
-                              blit=True, cache_frame_data=False)
-plt.show()
+        # compute ring points (rotating slightly by index)
+        inner_points = [
+            (center_x + inner_r * np.cos(a + inner_rotation * (i + 1)),
+             center_y + inner_r * np.sin(a + inner_rotation * (i + 1)))
+            for a in np.linspace(0, 2*np.pi, 240)
+        ]
+
+        # draw the inner ring onto the alpha surface (uses alpha thanks to SRCALPHA)
+        if len(inner_points) > 1:
+            pygame.draw.lines(alpha_surface, glow_color, True, inner_points, 2)
+
+    # Blit layers
+    screen.blit(reflection_surface, (0, 0))
+    screen.blit(alpha_surface, (0, 0))
+
+    pygame.display.flip()
+    clock.tick(FPS)
+    frame_count += 1
+
+pygame.quit()
+stream.stop()
+stream.close()
